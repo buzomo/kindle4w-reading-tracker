@@ -166,20 +166,20 @@ def save_log():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    WITH last_log AS (
-                        SELECT title, url
-                        FROM kindle_logs
-                        WHERE token = %s
-                        ORDER BY created_at DESC, id DESC
-                        LIMIT 1
-                    )
-                    INSERT INTO kindle_logs (token, title, url)
-                    SELECT %s, %s, %s
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM last_log
-                        WHERE last_log.title = %s AND ((last_log.url IS NULL AND %s IS NULL) OR (last_log.url = %s))
-                    )
-                    RETURNING id, created_at
+                WITH last_log AS (
+                    SELECT title, url
+                    FROM kindle_logs
+                    WHERE token = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                )
+                INSERT INTO kindle_logs (token, title, url)
+                SELECT %s, %s, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM last_log
+                    WHERE last_log.title = %s AND ((last_log.url IS NULL AND %s IS NULL) OR (last_log.url = %s))
+                )
+                RETURNING id, created_at
                 """,
                     (token, title, url),
                 )
