@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import psycopg2
-from psycopg2 import pool
+from psycopg2 import pool, sql
 import logging
 
 # ログ設定
@@ -15,8 +15,8 @@ CORS(app, resources={r"/save": {"origins": "*"}, r"/logs": {"origins": "*"}})
 # データベース接続プール
 db_pool = None
 
-
 def init_db_pool():
+    """データベース接続プールを初期化"""
     global db_pool
     DATABASE_URL = os.environ.get("DATABASE_URL")
     if not DATABASE_URL:
@@ -25,137 +25,166 @@ def init_db_pool():
 
     try:
         db_pool = psycopg2.pool.SimpleConnectionPool(
-            minconn=1, maxconn=5, dsn=DATABASE_URL
+            minconn=1,
+            maxconn=5,
+            dsn=DATABASE_URL
         )
-        logger.info("Database connection pool initialized")
+        logger.info("Database connection pool initialized successfully")
+        return True
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
-        raise
+        return False
 
+def create_table_if_not_exists():
+    """kindle_logs テーブルを作成（存在しない場合のみ）"""
+    if not db_pool:
+        logger.error("Database pool is not initialized")
+        return False
 
-def get_db_connection():
+    conn = None
     try:
         conn = db_pool.getconn()
-        logger.info("Database connection acquired from pool")
+        with conn.cursor() as cur:
+            # SQLインジェクション対策のため sql.SQL を使用
+            cur.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS kindle_logs (
+                    id SERIAL PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+            logger.info("Table 'kindle_logs' is ready")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to create table 'kindle_logs': {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+def get_db_connection():
+    """データベース接続を取得"""
+    try:
+        conn = db_pool.getconn()
+        logger.debug("Database connection acquired from pool")
         return conn
     except Exception as e:
         logger.error(f"Failed to acquire database connection: {e}")
         raise
 
-
 def release_db_connection(conn):
+    """データベース接続をプールに戻す"""
     try:
         db_pool.putconn(conn)
-        logger.info("Database connection released to pool")
+        logger.debug("Database connection released to pool")
     except Exception as e:
         logger.error(f"Failed to release database connection: {e}")
 
+# アプリ起動時にDBプールとテーブルを初期化
+if not init_db_pool():
+    logger.critical("Failed to initialize database pool. Some features may not work.")
+else:
+    if not create_table_if_not_exists():
+        logger.critical("Failed to create table 'kindle_logs'. Some features may not work.")
 
-def init_db():
-    """DB初期化: kindle_logsテーブルが存在しない場合に作成"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS kindle_logs (
-                id SERIAL PRIMARY KEY,
-                token TEXT NOT NULL,
-                title TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """
-        )
-        conn.commit()
-        logger.info("Database initialized: kindle_logs table is ready")
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        conn.rollback()
-    finally:
-        cur.close()
-        release_db_connection(conn)
-
-
-@app.route("/save", methods=["POST"])
+@app.route('/save', methods=['POST'])
 def save_log():
     """読書ログを保存"""
+    if not db_pool:
+        logger.error("Database pool is not available")
+        return jsonify({"status": "error", "message": "Database connection failed"}), 500
+
     try:
-        token = request.args.get("token")
-        title = request.json.get("title")
-        logger.info(f"Received token: {token}, title: {title}")
+        token = request.args.get('token')
+        title = request.json.get('title')
+        logger.info(f"Received request - token: {token}, title: {title}")
 
         if not token or not title:
-            logger.warning("Token or title missing")
-            return (
-                jsonify({"status": "error", "message": "Token or title missing"}),
-                400,
-            )
+            logger.warning("Token or title missing in request")
+            return jsonify({"status": "error", "message": "Token or title missing"}), 400
 
         conn = get_db_connection()
-        cur = conn.cursor()
         try:
-            cur.execute(
-                """
-                INSERT INTO kindle_logs (token, title) VALUES (%s, %s) RETURNING id, created_at
-            """,
-                (token, title),
-            )
-            log = cur.fetchone()
-            conn.commit()
-            logger.info(f"Inserted log: id={log[0]}, title={title}")
-            return jsonify(
-                {"status": "success", "id": log[0], "created_at": log[1].isoformat()}
-            )
-        except Exception as e:
-            logger.error(f"Failed to insert log: {e}")
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO kindle_logs (token, title) VALUES (%s, %s) RETURNING id, created_at
+                """, (token, title))
+                log = cur.fetchone()
+                conn.commit()
+                logger.info(f"Log saved successfully - id: {log[0]}, title: {title}")
+                return jsonify({
+                    "status": "success",
+                    "id": log[0],
+                    "created_at": log[1].isoformat()
+                })
+        except psycopg2.Error as e:
+            logger.error(f"Database error while saving log: {e}")
             conn.rollback()
-            return jsonify({"status": "error", "message": str(e)}), 500
+            return jsonify({"status": "error", "message": "Database error"}), 500
+        except Exception as e:
+            logger.error(f"Unexpected error while saving log: {e}")
+            return jsonify({"status": "error", "message": "Internal server error"}), 500
         finally:
-            cur.close()
             release_db_connection(conn)
     except Exception as e:
-        logger.error(f"Unexpected error in /save: {e}")
+        logger.error(f"Unexpected error in /save endpoint: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
-
-@app.route("/logs", methods=["GET"])
+@app.route('/logs', methods=['GET'])
 def get_logs():
     """読書ログを取得"""
+    if not db_pool:
+        logger.error("Database pool is not available")
+        return jsonify({"status": "error", "message": "Database connection failed"}), 500
+
     try:
-        token = request.args.get("token")
+        token = request.args.get('token')
         if not token:
             logger.warning("Token missing in /logs request")
             return jsonify({"status": "error", "message": "Token missing"}), 400
 
         conn = get_db_connection()
-        cur = conn.cursor()
         try:
-            cur.execute(
-                """
-                SELECT id, title, created_at FROM kindle_logs WHERE token = %s ORDER BY created_at DESC
-            """,
-                (token,),
-            )
-            logs = [
-                {"id": log[0], "title": log[1], "created_at": log[2].isoformat()}
-                for log in cur.fetchall()
-            ]
-            logger.info(f"Fetched {len(logs)} logs for token: {token}")
-            return jsonify({"status": "success", "logs": logs})
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, title, created_at
+                    FROM kindle_logs
+                    WHERE token = %s
+                    ORDER BY created_at DESC
+                """, (token,))
+                logs = [{
+                    "id": row[0],
+                    "title": row[1],
+                    "created_at": row[2].isoformat()
+                } for row in cur.fetchall()]
+                logger.info(f"Retrieved {len(logs)} logs for token: {token}")
+                return jsonify({"status": "success", "logs": logs})
+        except psycopg2.Error as e:
+            logger.error(f"Database error while fetching logs: {e}")
+            return jsonify({"status": "error", "message": "Database error"}), 500
         except Exception as e:
-            logger.error(f"Failed to fetch logs: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+            logger.error(f"Unexpected error while fetching logs: {e}")
+            return jsonify({"status": "error", "message": "Internal server error"}), 500
         finally:
-            cur.close()
             release_db_connection(conn)
     except Exception as e:
-        logger.error(f"Unexpected error in /logs: {e}")
+        logger.error(f"Unexpected error in /logs endpoint: {e}")
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
+@app.route('/init-db', methods=['GET'])
+def init_db():
+    """手動でテーブルを初期化（デバッグ用）"""
+    if not db_pool:
+        return jsonify({"status": "error", "message": "Database pool not initialized"}), 500
 
-# アプリ起動時にDBプールとテーブルを初期化
-init_db_pool()
-init_db()
+    if create_table_if_not_exists():
+        return jsonify({"status": "success", "message": "Table initialized successfully"})
+    else:
+        return jsonify({"status": "error", "message": "Failed to initialize table"}), 500
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(debug=True)
