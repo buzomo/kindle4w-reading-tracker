@@ -177,13 +177,27 @@ def save_log():
                 SELECT %s, %s, %s
                 WHERE NOT EXISTS (
                     SELECT 1 FROM last_log
-                    WHERE last_log.title = %s AND ((last_log.url IS NULL AND %s IS NULL) OR (last_log.url = %s))
+                    WHERE last_log.title = %s 
+                    AND (
+                        (last_log.url IS NULL AND %s IS NULL) 
+                        OR (last_log.url = %s)
+                    )
                 )
                 RETURNING id, created_at
                 """,
-                    (token, title, url),
+                    (token, token, title, url, title, url, url),
                 )
                 log = cur.fetchone()
+                if log is None:
+                    # 重複だった → 挿入されなかった → 成功とみなす（または最新のログを返す）
+                    logger.info(
+                        f"Duplicate log skipped - token: {token}, title: {title}"
+                    )
+                    return (
+                        jsonify({"status": "skipped", "message": "Duplicate entry"}),
+                        200,
+                    )
+
                 conn.commit()
                 logger.info(f"Log saved successfully - id: {log[0]}, title: {title}")
                 return jsonify(
